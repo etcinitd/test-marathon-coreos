@@ -1,0 +1,341 @@
+#cloud-config
+
+---
+coreos:
+  update:
+    reboot-strategy: off
+  units:
+  - name: etcd.service
+    command: start
+  - name: fleet.service
+    command: start
+  - name: consul-master.service
+    content: |
+      [Unit]
+      Description=Consul Master
+      After=etcd.service
+      Requires=etcd.service
+      Conflicts=consul-worker.service
+
+      [Service]
+      EnvironmentFile=/etc/environment
+      EnvironmentFile=/etc/ncp_environment
+      Restart=on-failure
+      RestartSec=5
+      TimeoutStartSec=0
+
+      # make sure /etc/systemd/resoleved.conf.d dir exists so we can add Consul's DNS resolver to system
+      ExecStartPre=/usr/bin/mkdir -p /etc/systemd/resolved.conf.d
+      ExecStartPre=-/usr/bin/docker kill consul-master
+      ExecStartPre=-/usr/bin/docker rm consul-master
+      ExecStart=/usr/bin/docker run --name consul-master \
+        -v /mnt:/data \
+        --net=host \
+        -p 8500:8500 \
+        progrium/consul -server -bootstrap-expect ${NCP_NUM_MASTERS} -ui-dir /ui -advertise ${NCP_IP} -join "${NCP_MASTERS}"
+      ExecStop=/usr/bin/docker stop consul-master
+
+      [Install]
+      WantedBy=multi-user.target
+  - name: consul-worker.service
+    content: |
+      [Unit]
+      Description=Consul Worker
+      After=etcd.service
+      Requires=etcd.service
+      Conflicts=consul-master.service
+
+      [Service]
+      EnvironmentFile=/etc/environment
+      EnvironmentFile=/etc/ncp_environment
+      Restart=on-failure
+      RestartSec=5
+      TimeoutStartSec=0
+
+      # make sure /etc/systemd/resoleved.conf.d dir exists so we can add Consul's DNS resolver to system
+      ExecStartPre=/usr/bin/mkdir -p /etc/systemd/resolved.conf.d
+      ExecStartPre=-/usr/bin/docker kill consul-worker
+      ExecStartPre=-/usr/bin/docker rm consul-worker
+      ExecStart=/usr/bin/docker run --name consul-worker \
+        -v /mnt:/data \
+        --net=host \
+        -p 8500:8500 \
+        -e "SERVICE_8500_NAME=consul" \
+        progrium/consul -advertise ${NCP_IP} -join "${NCP_MASTERS}"
+      ExecStop=/usr/bin/docker stop consul-worker
+
+      [Install]
+      WantedBy=multi-user.target
+  - name: docker.service
+    content: |
+      [Unit]
+      Description=Docker Application Container Engine
+      Documentation=http://docs.docker.com
+      After=docker.socket early-docker.target network.target
+      Requires=docker.socket early-docker.target
+
+      [Service]
+      Restart=on-failure
+      RestartSec=5
+      TimeoutStartSec=0
+
+      Environment=TMPDIR=/var/tmp
+      EnvironmentFile=-/run/flannel_docker_opts.env
+      EnvironmentFile=-/run/docker_opts.env
+      EnvironmentFile=/etc/environment
+      EnvironmentFile=/etc/ncp_environment
+      MountFlags=slave
+      LimitNOFILE=1048576
+      LimitNPROC=1048576
+
+      # Contrary to systemd convention DOCKER_OPTS must not be ${DOCKER_OPTS} or /usr/lib/coreos/dockerd
+      # will incorrectly parse this command and fail to execute (it will instead print a help message!)
+      ExecStart=/usr/lib/coreos/dockerd --daemon --host=fd:// --dns=${NCP_IP} --dns-search=service.consul $DOCKER_OPTS
+
+      [Install]
+      WantedBy=multi-user.target
+  - name: marathon.service
+    content: |
+      [Unit]
+      Description=Marathon
+      After=mesos-master.service
+      Requires=mesos-master.service
+      Wants=network-online.target
+      After=network-online.target
+
+      [Service]
+      Restart=on-failure
+      RestartSec=5
+      TimeoutStartSec=0
+
+      EnvironmentFile=/etc/environment
+      EnvironmentFile=/etc/ncp_environment
+      ExecStartPre=-/usr/bin/docker kill marathon
+      ExecStartPre=-/usr/bin/docker rm marathon
+      ExecStart=/usr/bin/docker run \
+          --name marathon \
+          -e "NCP_IP=${NCP_IP}" \
+          -e "NCP_MASTERS=${NCP_MASTERS}" \
+          --net=host \
+          jwnintex/marathon
+      ExecStop=/usr/bin/docker stop marathon
+
+      [Install]
+      WantedBy=multi-user.target
+  - name: mesos-master.service
+    content: |
+      [Unit]
+      Description=Mesos Master
+      After=consul-master.service
+      Requires=consul-master.service
+      Conflicts=mesos-worker.service
+
+      [Service]
+      Restart=on-failure
+      RestartSec=5
+      TimeoutStartSec=0
+
+      EnvironmentFile=/etc/environment
+      EnvironmentFile=/etc/ncp_environment
+      ExecStartPre=-/usr/bin/docker kill mesos-master
+      ExecStartPre=-/usr/bin/docker rm mesos-master
+      ExecStart=/usr/bin/docker run \
+                                --name mesos-master \
+                                --privileged \
+                                --net=host \
+                                -e "NCP_IP=${NCP_IP}" \
+                                -e "NCP_MASTERS=${NCP_MASTERS}" \
+                                -e "NCP_NUM_MASTERS=${NCP_NUM_MASTERS}" \
+                                jwnintex/mesos-master
+      ExecStop=/usr/bin/docker stop mesos-master
+
+      [Install]
+      WantedBy=multi-user.target
+  - name: mesos-worker.service
+    content: |
+      [Unit]
+      Description=Mesos Worker
+      After=etcd.service
+      Requires=etcd.service
+      Conflicts=mesos-master.service
+
+      [Service]
+      Restart=on-failure
+      RestartSec=5
+      TimeoutStartSec=0
+
+      EnvironmentFile=/etc/environment
+      EnvironmentFile=/etc/ncp_environment
+      ExecStartPre=-/usr/bin/docker kill worker
+      ExecStartPre=-/usr/bin/docker rm worker
+      ExecStart=/usr/bin/docker run \
+                                --name worker \
+                                --privileged \
+                                --net=host \
+                                -v /sys:/sys \
+                                -v /usr/bin/docker:/usr/bin/docker:ro \
+                                -v /var/run/docker.sock:/var/run/docker.sock \
+                                -v /lib64/libdevmapper.so.1.02:/lib/libdevmapper.so.1.02:ro \
+                                -e "NCP_IP=${NCP_IP}" \
+                                -e "NCP_MASTERS=${NCP_MASTERS}" \
+                                jwnintex/mesos-worker
+      ExecStop=/usr/bin/docker stop mesos-worker
+
+      [Install]
+      WantedBy=multi-user.target
+  - name: port-router.service
+    content: |
+      [Unit]
+      Description=Port Router
+      After=consul-master.service
+      After=consul-worker.service
+
+      [Service]
+      Restart=on-failure
+      RestartSec=5
+      TimeoutStartSec=0
+
+      EnvironmentFile=/etc/environment
+      EnvironmentFile=/etc/ncp_environment
+      ExecStartPre=-/usr/bin/docker kill port-router
+      ExecStartPre=-/usr/bin/docker rm port-router
+      ExecStart=/usr/bin/docker run --name port-router \
+        -e "NCP_IP=${NCP_IP}" \
+        -e "NCP_MASTERS=${NCP_MASTERS}" \
+        --net=host \
+        jwnintex/nginx-port-router
+      ExecStop=/usr/bin/docker stop nginx-port-router
+
+      [Install]
+      WantedBy=multi-user.target
+  - name: registrator.service
+    content: |
+      [Unit]
+      Description=Registrator
+      After=docker.service
+      After=consul-master.service
+      After=consul-worker.service
+      Requires=docker.service
+
+      [Service]
+      Restart=on-failure
+      RestartSec=5
+      TimeoutStartSec=0
+
+      EnvironmentFile=/etc/environment
+      EnvironmentFile=/etc/ncp_environment
+      ExecStartPre=-/usr/bin/docker kill registrator
+      ExecStartPre=-/usr/bin/docker rm registrator
+      ExecStart=/usr/bin/docker run -h ${NCP_IP} \
+                                --name registrator \
+                                -v /var/run/docker.sock:/tmp/docker.sock \
+                                gliderlabs/registrator consul://${NCP_IP}:8500
+      ExecStop=/usr/bin/docker stop registrator
+
+      [Install]
+      WantedBy=multi-user.target
+  - name: zookeeper.service
+    content: |
+      [Unit]
+      Description=Zookeeper
+      After=consul-master.service
+      Requires=consul-master.service
+
+      [Service]
+      Restart=on-failure
+      RestartSec=5
+      TimeoutStartSec=0
+
+      EnvironmentFile=/etc/environment
+      EnvironmentFile=/etc/ncp_environment
+      ExecStartPre=-/usr/bin/docker kill zookeeper
+      ExecStartPre=-/usr/bin/docker rm zookeeper
+      ExecStart=/usr/bin/docker run --name zookeeper \
+        -e "ZOO_UNIQUE_ID=${NCP_UNIQUE_CLOUD_ID}" \
+        -e "ZOO_MASTERS=${NCP_MASTERS}" \
+        --net=host \
+        jwnintex/zookeeper
+      ExecStop=/usr/bin/docker stop zookeeper
+
+      [Install]
+      WantedBy=multi-user.target
+write_files:
+- path: /home/core/bootstrap-as-master
+  permissions: 744
+  owner: root
+  content: |-
+    #!/bin/bash
+    echo "Enabling & Starting consul-master"
+    systemctl enable consul-master
+    systemctl start consul-master
+    echo "Done"
+
+    echo "Enabling & Starting registrator"
+    systemctl enable registrator
+    systemctl start registrator
+    echo "Done"
+
+    echo "Enabling & Starting zookeeper"
+    systemctl enable zookeeper
+    systemctl start zookeeper
+    echo "Done"
+
+    echo "Enabling & Starting mesos-master"
+    systemctl enable mesos-master
+    systemctl start mesos-master
+    echo "Done"
+
+    echo "Enabling & Starting marathon"
+    systemctl enable marathon
+    systemctl start marathon
+    echo "Done"
+
+    echo "Enabling & Starting nginx-port-router"
+    systemctl enable port-router
+    systemctl start port-router
+    echo "Done"
+- path: /home/core/bootstrap-as-worker
+  permissions: 744
+  owner: root
+  content: |-
+    #!/bin/bash
+
+    echo "Enabling & Starting consul-worker"
+    systemctl enable consul-worker
+    systemctl start consul-worker
+    echo "Done"
+
+    echo "Enabling & Starting registrator"
+    systemctl enable registrator
+    systemctl start registrator
+    echo "Done"
+
+    echo "Enabling & Starting mesos-worker"
+    systemctl enable mesos-worker
+    systemctl start mesos-worker
+    echo "Done"
+
+    echo "Enabling & Starting nginx-port-router"
+    systemctl enable port-router
+    systemctl start port-router
+    echo "Done"
+- path: /home/core/bootstrap-as-devhost
+  permissions: 744
+  owner: root
+  content: |-
+    #!/bin/bash
+
+    echo "Enabling & Starting consul-worker"
+    systemctl enable consul-worker
+    systemctl start consul-worker
+    echo "Done"
+
+    echo "Enabling & Starting registrator"
+    systemctl enable registrator
+    systemctl start registrator
+    echo "Done"
+
+    echo "Enabling & Starting nginx-port-router"
+    systemctl enable port-router
+    systemctl start port-router
+    echo "Done"
