@@ -1,4 +1,6 @@
 #cloud-config
+manage_etc_hosts: localhost
+
 coreos:
     units:
       - name: coreos-cloudinit-vagrant-mkdir.service
